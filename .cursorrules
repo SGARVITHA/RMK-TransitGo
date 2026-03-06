@@ -1,0 +1,253 @@
+# RMK - TransitGo — Cursor Rules
+
+## Project Identity
+  - App Name: RMK - TransitGo
+    - Type: React Native mobile app(Expo SDK 51 +)
+      - Purpose: Campus bus tracking system for RMK College
+        - Roles: Student, Driver, Admin
+          - Backend: Supabase ONLY(Auth + Postgres + Realtime)
+
+---
+
+## Non - Negotiable Backend Rules
+  - ALWAYS use `@supabase/supabase-js` for ALL data operations
+    - NEVER use localStorage, AsyncStorage as a database substitute, in -memory arrays as persistent state, or any mock / fake backend
+      - ALL auth must go through `supabase.auth.signUp()` and`supabase.auth.signInWithPassword()`
+        - ALL data reads / writes must use`supabase.from('table').select/insert/update/delete()`
+          - ALL real - time features must use `supabase.channel().on('postgres_changes', ...)` subscriptions
+            - Supabase client lives in `lib/supabase.ts` and is imported everywhere — never re - initialised
+
+---
+
+## Project Structure
+  ```
+app/
+  (auth)/
+    welcome.tsx        ← role selection screen
+    student-auth.tsx   ← student sign in / sign up
+    driver-auth.tsx    ← driver sign in / sign up
+    admin-auth.tsx     ← admin sign in
+  (student)/
+    index.tsx          ← home: map + wait for me
+    schedule.tsx       ← route stops + ETAs
+    profile.tsx        ← student profile + sign out
+  (driver)/
+    index.tsx          ← trip control + alert panel
+    route.tsx          ← assigned route + stops
+    profile.tsx        ← driver profile + sign out
+  (admin)/
+    index.tsx          ← fleet management
+    routes.tsx         ← route + stop management
+    logs.tsx           ← trip history logs
+lib/
+  supabase.ts          ← supabase client (single source of truth)
+  types.ts             ← all TypeScript interfaces
+constants/
+  theme.ts             ← all colors, fonts, spacing
+```
+
+---
+
+## Design System(Follow Exactly — Cityflo - Inspired)
+
+### Colors(from constants / theme.ts)
+  ```ts
+export const Colors = {
+  primary:    '#F5C518',   // yellow — highlight actions
+  dark:       '#1A1A1A',   // near black — primary CTA buttons, text
+  bg:         '#FAFAF8',   // off-white — screen background
+  surface:    '#FFFFFF',   // white — cards
+  border:     '#EEEEEE',   // dividers
+  textPrimary:'#111111',   // main text
+  textSecond: '#888888',   // secondary/label text
+  green:      '#22C55E',   // active/live/accept states
+  red:        '#EF4444',   // deny/end/cancel states
+  amber:      '#F59E0B',   // warnings / no-response state
+  blue:       '#3B82F6',   // student ping dot on map
+}
+```
+
+### Typography
+  - Body font: `DM Sans`(via`@expo-google-fonts/dm-sans`)
+    - Mono font: `DM Mono`(via`@expo-google-fonts/dm-mono`) — use for bus numbers, plates, times, IDs
+      - Never use system fonts(no Arial, Roboto, San Francisco defaults)
+
+### Component Rules
+  - Card border - radius: `20px`
+    - Button border - radius: `14px`
+      - Input border - radius: `12px`
+        - Card shadow: `{ shadowColor:'#000', shadowOffset:{width:0,height:2}, shadowOpacity:0.07, shadowRadius:8, elevation:3 }`
+          - Primary CTA button: dark background(`#1A1A1A`) + white text + bold
+            - Highlight button: yellow(`#F5C518`) + black text + bold
+              - All screens: off - white(`#FAFAF8`) background
+                - Map: OpenStreetMap tiles — `urlTemplate="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"`
+
+---
+
+## TypeScript Interfaces(from lib / types.ts)
+  ```ts
+export interface Profile {
+  id: string;
+  full_name: string;
+  role: 'student' | 'driver' | 'admin';
+  created_at: string;
+}
+export interface Student {
+  id: string;
+  roll_number: string;
+  bus_number: string;    // e.g. "Bus 5" — route ID, NOT the plate
+  bus_stop: string;
+  email: string;
+}
+export interface Driver {
+  id: string;
+  employee_id: string;
+  bus_number: string;    // e.g. "Bus 5" — route ID
+  number_plate: string;  // e.g. "TN09 AB 1234" — physical vehicle
+  email: string;
+}
+export interface Bus {
+  id: string;
+  bus_number: string;    // route identifier e.g. "Bus 5"
+  number_plate: string;  // vehicle plate e.g. "TN09 AB 1234"
+  route_id: string;
+  status: 'idle' | 'on_trip';
+}
+export interface Route {
+  id: string;
+  name: string;
+  created_at: string;
+}
+export interface Stop {
+  id: string;
+  route_id: string;
+  name: string;
+  sequence: number;
+}
+export interface Trip {
+  id: string;
+  bus_number: string;
+  number_plate: string;
+  route_id: string;
+  driver_id: string;
+  start_time: string;
+  end_time: string | null;
+  status: 'active' | 'completed';
+  created_at: string;
+}
+export interface WaitAlert {
+  id: string;
+  trip_id: string;
+  student_id: string;
+  student_name: string;
+  bus_stop: string;
+  status: 'pending' | 'accepted' | 'denied' | 'expired';
+  created_at: string;
+}
+```
+
+---
+
+## Supabase Schema(run this SQL in Supabase dashboard)
+  ```sql
+-- Profiles
+create table profiles (
+  id uuid references auth.users primary key,
+  full_name text not null,
+  role text check (role in ('student','driver','admin')) not null,
+  created_at timestamptz default now()
+);
+
+-- Students
+create table students (
+  id uuid references profiles primary key,
+  roll_number text unique not null,
+  bus_number text not null,
+  bus_stop text not null,
+  email text not null
+);
+
+-- Drivers
+create table drivers (
+  id uuid references profiles primary key,
+  employee_id text unique not null,
+  bus_number text not null,
+  number_plate text not null,
+  email text not null
+);
+
+-- Routes
+create table routes (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz default now()
+);
+
+-- Stops
+create table stops (
+  id uuid primary key default gen_random_uuid(),
+  route_id uuid references routes on delete cascade,
+  name text not null,
+  sequence int not null
+);
+
+-- Buses
+create table buses (
+  id uuid primary key default gen_random_uuid(),
+  bus_number text unique not null,
+  number_plate text unique not null,
+  route_id uuid references routes,
+  status text default 'idle' check (status in ('idle','on_trip'))
+);
+
+-- Trips
+create table trips (
+  id uuid primary key default gen_random_uuid(),
+  bus_number text not null,
+  number_plate text not null,
+  route_id uuid references routes,
+  driver_id uuid references drivers,
+  start_time timestamptz default now(),
+  end_time timestamptz,
+  status text check (status in ('active','completed')) default 'active',
+  created_at timestamptz default now()
+);
+
+-- Wait Alerts
+create table wait_alerts (
+  id uuid primary key default gen_random_uuid(),
+  trip_id uuid references trips,
+  student_id uuid references students,
+  student_name text not null,
+  bus_stop text not null,
+  status text default 'pending' check (status in ('pending','accepted','denied','expired')),
+  created_at timestamptz default now()
+);
+
+-- Enable RLS
+alter table profiles    enable row level security;
+alter table students    enable row level security;
+alter table drivers     enable row level security;
+alter table buses       enable row level security;
+alter table routes      enable row level security;
+alter table stops       enable row level security;
+alter table trips       enable row level security;
+alter table wait_alerts enable row level security;
+
+-- Enable Realtime
+alter publication supabase_realtime add table wait_alerts;
+alter publication supabase_realtime add table trips;
+alter publication supabase_realtime add table buses;
+```
+
+---
+
+## Coding Standards
+  - Use TypeScript everywhere — no `.js` files
+    - Use functional components with hooks only — no class components
+- Use`expo-router` for navigation(file - based routing)
+  - Handle all loading states with an`ActivityIndicator`
+  - Handle all Supabase errors with try/catch and show user-facing error messages
+    - Never leave TODO comments — implement everything fully
+      - Never use `any` type in TypeScript
+        - Always clean up Supabase Realtime subscriptions in `useEffect` return

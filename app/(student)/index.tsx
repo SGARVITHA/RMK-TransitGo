@@ -1,701 +1,780 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import { Ionicons } from '@expo/vector-icons'
 import {
-  View,
-  Text,
-  StyleSheet,
-  Dimensions,
-  ActivityIndicator,
-  TouchableOpacity,
-  ScrollView,
-  Platform,
+  View, Text, StyleSheet, TouchableOpacity,
+  ScrollView, Animated, Dimensions, ActivityIndicator,
+  Platform
 } from 'react-native'
-import MapView, { Marker, Polyline } from 'react-native-maps'
-import type { Region } from 'react-native-maps'
-import * as Location from 'expo-location'
-import { Colors } from '../../constants/theme'
+import { SafeAreaView } from 'react-native-safe-area-context'
+import { router } from 'expo-router'
+import { useState, useEffect, useRef } from 'react'
 import { supabase } from '../../lib/supabase'
-import { Student, Trip, Stop, Bus, Route as RouteType, WaitAlert } from '../../lib/types'
+import {
+  useFonts, DMSans_400Regular,
+  DMSans_600SemiBold, DMSans_700Bold,
+  DMSans_800ExtraBold,
+} from '@expo-google-fonts/dm-sans'
+import { DMMono_400Regular } from '@expo-google-fonts/dm-mono'
+import { Colors } from '../../constants/theme'
 
-const { height: SCREEN_HEIGHT } = Dimensions.get('window')
+const { width, height } = Dimensions.get('window')
 
-const UrlTile =
-  Platform.OS === 'web'
-    ? (() => null)
-    : (require('react-native-maps') as typeof import('react-native-maps')).UrlTile
-
-interface BusWithPosition extends Bus {
-  latitude?: number
-  longitude?: number
-}
-
-const DEV_STOPS_COORDS: { [name: string]: { latitude: number; longitude: number } } = {
-  'RMK College Gate': { latitude: 13.2105, longitude: 80.0263 },
-  'Thiruvallur Junction': { latitude: 13.1435, longitude: 79.913 },
-  'Ambattur OT': { latitude: 13.1143, longitude: 80.1523 },
-  'Anna Nagar': { latitude: 13.086, longitude: 80.2206 },
-  Koyambedu: { latitude: 13.072, longitude: 80.1945 },
-}
-
-type BannerType = 'success' | 'error' | 'warning'
-
-interface BannerState {
-  type: BannerType
-  message: string
-}
-
-export default function StudentHomeScreen() {
-  const [student, setStudent] = useState<Student | null>(null)
-  const [trip, setTrip] = useState<Trip | null>(null)
-  const [route, setRoute] = useState<RouteType | null>(null)
-  const [stops, setStops] = useState<Stop[]>([])
-  const [busPosition, setBusPosition] = useState<{ latitude: number; longitude: number } | null>(
-    null,
+let MapView: any, Marker: any, Polyline: any
+if (Platform.OS === 'web') {
+  MapView = ({ style, children }: any) => (
+    <View style={[style, styles.mapWebPlaceholder]}>
+      <Ionicons name="map" size={32} color={Colors.textTertiary} />
+      <Text style={styles.mapWebText}>
+        Map preview available on mobile only
+      </Text>
+      {children}
+    </View>
   )
-  const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(
-    null,
-  )
+  Marker = () => null
+  Polyline = () => null
+} else {
+  const Maps = require('react-native-maps')
+  MapView = Maps.default
+  Marker = Maps.Marker
+  Polyline = Maps.Polyline
+}
+
+export default function StudentHome() {
+  const [fontsLoaded] = useFonts({
+    DMSans_400Regular, DMSans_600SemiBold,
+    DMSans_700Bold, DMSans_800ExtraBold,
+    DMMono_400Regular,
+  })
+  const [studentData, setStudentData] = useState<any>(null)
+  const [profileData, setProfileData] = useState<any>(null)
+  const [tripData, setTripData] = useState<any>(null)
+  const [stops, setStops] = useState<any[]>([])
+  const [busData, setBusData] = useState<any>(null)
+  const [busLocation, setBusLocation] = useState<any>(null)
+  const [mapExpanded, setMapExpanded] = useState(false)
+  const [alertStatus, setAlertStatus] = useState<
+    'idle' | 'pending' | 'accepted' | 'denied' | 'expired'
+  >('idle')
+  const [secondsLeft, setSecondsLeft] = useState(120)
   const [loading, setLoading] = useState(true)
+  const [waitLoading, setWaitLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const timerRef = useRef<any>(null)
 
-  const [isWaiting, setIsWaiting] = useState(false)
-  const [remainingSeconds, setRemainingSeconds] = useState(0)
-  const [activeAlertId, setActiveAlertId] = useState<string | null>(null)
-  const [banner, setBanner] = useState<BannerState | null>(null)
+  const mapHeightAnim = useRef(
+    new Animated.Value(height * 0.5)
+  ).current
+
+  const loadData = async () => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) return
+
+      const { data: profile } = await supabase
+        .from('profiles').select('*')
+        .eq('id', user.id).single()
+      setProfileData(profile)
+
+      const { data: student } = await supabase
+        .from('students').select('*')
+        .eq('id', user.id).single()
+      setStudentData(student)
+
+      if (student?.bus_number) {
+        const { data: bus } = await supabase
+          .from('buses').select('*')
+          .eq('bus_number', student.bus_number).single()
+        setBusData(bus)
+
+        if (bus?.route_id) {
+          const { data: routeStops } = await supabase
+            .from('stops').select('*')
+            .eq('route_id', bus.route_id)
+            .order('sequence')
+          setStops(routeStops || [])
+        }
+
+        const { data: trips } = await supabase
+          .from('trips').select('*')
+          .eq('bus_number', student.bus_number)
+          .eq('status', 'active')
+          .order('created_at', { ascending: false })
+          .limit(1)
+        setTripData(trips?.[0] || null)
+
+        const { data: loc } = await supabase
+          .from('bus_locations').select('*')
+          .eq('bus_number', student.bus_number)
+          .order('updated_at', { ascending: false })
+          .limit(1)
+        setBusLocation(loc?.[0] || null)
+      }
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { loadData() }, [])
+
+  // Realtime bus location updates
+  useEffect(() => {
+    if (!studentData?.bus_number) return
+    const channel = supabase
+      .channel('bus-location-updates')
+      .on('postgres_changes', {
+        event: '*', schema: 'public',
+        table: 'bus_locations',
+        filter: `bus_number=eq.${studentData.bus_number}`,
+      }, (payload) => {
+        setBusLocation(payload.new)
+      })
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }, [studentData?.bus_number])
+
+  // Realtime wait alert response
+  useEffect(() => {
+    if (!studentData) return
+    const channel = supabase
+      .channel('wait-alert-response')
+      .on('postgres_changes', {
+        event: 'UPDATE', schema: 'public',
+        table: 'wait_alerts',
+      }, (payload) => {
+        const s = payload.new.status
+        if (s === 'accepted' || s === 'denied') {
+          clearInterval(timerRef.current)
+          setSecondsLeft(120)
+          setAlertStatus(s)
+          setTimeout(() => setAlertStatus('idle'), 4000)
+        }
+      })
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }, [studentData])
 
   useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true)
-      setError(null)
-      try {
-        const {
-          data: { user },
-          error: userError,
-        } = await supabase.auth.getUser()
-        if (userError) {
-          throw userError
-        }
-        if (!user) {
-          throw new Error('Not signed in')
-        }
-
-        const { data: studentData, error: studentError } = await supabase
-          .from('students')
-          .select('*')
-          .eq('id', user.id)
-          .single<Student>()
-        if (studentError) {
-          throw studentError
-        }
-        setStudent(studentData)
-
-        const { data: tripData } = await supabase
-          .from('trips')
-          .select('*')
-          .eq('bus_number', studentData.bus_number)
-          .eq('status', 'active')
-          .maybeSingle<Trip>()
-        if (tripData) {
-          setTrip(tripData)
-
-          if (tripData.route_id) {
-            const { data: routeData } = await supabase
-              .from('routes')
-              .select('*')
-              .eq('id', tripData.route_id)
-              .single<RouteType>()
-            setRoute(routeData)
-          }
-
-          const { data: stopsData } = await supabase
-            .from('stops')
-            .select('*')
-            .eq('route_id', tripData.route_id)
-            .order('sequence', { ascending: true })
-            .returns<Stop[]>()
-          if (stopsData) {
-            setStops(stopsData)
-          }
-        }
-
-        if (Platform.OS !== 'web') {
-          const { status } = await Location.requestForegroundPermissionsAsync()
-          if (status === 'granted') {
-            const current = await Location.getCurrentPositionAsync({})
-            setUserLocation({
-              latitude: current.coords.latitude,
-              longitude: current.coords.longitude,
-            })
-          }
-        }
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : 'Unable to load trip data. Please try again.'
-        setError(message)
-      } finally {
-        setLoading(false)
-      }
-    }
-
-    fetchData()
+    return () => clearInterval(timerRef.current)
   }, [])
 
-  useEffect(() => {
-    if (!student) {
-      return
-    }
-
-    const channel = supabase
-      .channel('buses-position')
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'buses',
-          filter: `bus_number=eq.${student.bus_number}`,
-        },
-        payload => {
-          const row = payload.new as BusWithPosition
-          if (row.latitude && row.longitude) {
-            setBusPosition({
-              latitude: row.latitude,
-              longitude: row.longitude,
-            })
-          }
-        },
-      )
-
-    channel.subscribe()
-
-    return () => {
-      supabase.removeChannel(channel)
-    }
-  }, [student])
-
-  useEffect(() => {
-    if (!student) {
-      return
-    }
-
-    const channel = supabase
-      .channel('wait-alerts-student')
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'wait_alerts',
-          filter: `student_id=eq.${student.id}`,
-        },
-        payload => {
-          const alert = payload.new as WaitAlert
-          if (!activeAlertId || alert.id !== activeAlertId) {
-            return
-          }
-
-          if (alert.status === 'accepted') {
-            setBanner({ type: 'success', message: '✅ Driver is waiting for you!' })
-            setIsWaiting(false)
-            setActiveAlertId(null)
-            setRemainingSeconds(0)
-          } else if (alert.status === 'denied') {
-            setBanner({ type: 'error', message: '❌ Driver cannot wait' })
-            setIsWaiting(false)
-            setActiveAlertId(null)
-            setRemainingSeconds(0)
-          }
-        },
-      )
-
-    channel.subscribe()
-
-    return () => {
-      supabase.removeChannel(channel)
-    }
-  }, [student, activeAlertId])
-
-  useEffect(() => {
-    if (!isWaiting || !activeAlertId) {
-      return
-    }
-
-    setRemainingSeconds(120)
-    const interval = setInterval(() => {
-      setRemainingSeconds(prev => {
-        if (prev <= 1) {
-          clearInterval(interval)
-          void handleExpire(activeAlertId)
-          return 0
-        }
-        return prev - 1
-      })
-    }, 1000)
-
-    return () => {
-      clearInterval(interval)
-    }
-  }, [isWaiting, activeAlertId])
-
-  const handleExpire = async (alertId: string) => {
-    try {
-      await supabase
-        .from('wait_alerts')
-        .update({ status: 'expired' })
-        .eq('id', alertId)
-
-      setBanner({
-        type: 'warning',
-        message: '⚠️ Driver did not respond. Try again?',
-      })
-    } finally {
-      setIsWaiting(false)
-      setActiveAlertId(null)
-      setRemainingSeconds(0)
-    }
+  const toggleMap = () => {
+    const toValue = mapExpanded
+      ? height * 0.5
+      : height * 0.85
+    Animated.spring(mapHeightAnim, {
+      toValue, tension: 50, friction: 8,
+      useNativeDriver: false,
+    }).start()
+    setMapExpanded(!mapExpanded)
   }
 
-  const handleWaitForMePress = async () => {
-    if (!student || !trip) {
+  const formatTime = (s: number) =>
+    `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+
+  const handleWaitForMe = async () => {
+    if (alertStatus === 'pending') {
+      clearInterval(timerRef.current)
+      setAlertStatus('idle')
+      setSecondsLeft(120)
       return
     }
-
-    if (isWaiting && activeAlertId) {
-      await supabase.from('wait_alerts').delete().eq('id', activeAlertId)
-      setIsWaiting(false)
-      setActiveAlertId(null)
-      setRemainingSeconds(0)
-      return
-    }
-
+    setWaitLoading(true)
     try {
-      const { data, error: insertError } = await supabase
-        .from('wait_alerts')
-        .insert({
-          trip_id: trip.id,
-          student_id: student.id,
-          student_name: (student as unknown as { full_name?: string }).full_name ?? '',
-          bus_stop: student.bus_stop,
-          status: 'pending',
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!tripData) throw new Error(
+        'No active trip for your bus right now.'
+      )
+      await supabase.from('wait_alerts').insert({
+        trip_id: tripData.id,
+        student_id: user!.id,
+        student_name: profileData?.full_name,
+        bus_stop: studentData?.bus_stop,
+        status: 'pending',
+      })
+      setAlertStatus('pending')
+      setSecondsLeft(120)
+      timerRef.current = setInterval(() => {
+        setSecondsLeft(s => {
+          if (s <= 1) {
+            clearInterval(timerRef.current)
+            setAlertStatus('expired')
+            setSecondsLeft(120)
+            setTimeout(() => setAlertStatus('idle'), 4000)
+            return 120
+          }
+          return s - 1
         })
-        .select()
-        .single<WaitAlert>()
-
-      if (insertError) {
-        throw insertError
-      }
-
-      setBanner(null)
-      setIsWaiting(true)
-      setActiveAlertId(data.id)
-      setRemainingSeconds(120)
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Could not send alert. Please try again.'
-      setBanner({ type: 'error', message })
+      }, 1000)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setWaitLoading(false)
     }
   }
 
-  const polylineCoordinates = useMemo(
-    () =>
-      stops
-        .map(stop => DEV_STOPS_COORDS[stop.name])
-        .filter(Boolean) as { latitude: number; longitude: number }[],
-    [stops],
+  const getInitials = (name: string) => {
+    if (!name) return 'U'
+    const parts = name.trim().split(' ')
+    if (parts.length === 1) return parts[0][0].toUpperCase()
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
+  }
+
+  const getFirstName = (name: string) =>
+    name?.trim().split(' ')[0] || 'there'
+
+  if (!fontsLoaded || loading) return (
+    <View style={styles.loadingContainer}>
+      <ActivityIndicator size="large" color={Colors.textPrimary} />
+    </View>
   )
 
-  const initialRegion: Region | undefined = useMemo(() => {
-    const first = polylineCoordinates[0]
-    if (first) {
-      return {
-        ...first,
-        latitudeDelta: 0.2,
-        longitudeDelta: 0.2,
-      }
-    }
-    if (userLocation) {
-      return {
-        ...userLocation,
-        latitudeDelta: 0.2,
-        longitudeDelta: 0.2,
-      }
-    }
-    return undefined
-  }, [polylineCoordinates, userLocation])
-
-  const nextStopName = stops[0]?.name ?? 'TBD'
-
-  const formatCountdown = (seconds: number) => {
-    const mins = Math.floor(seconds / 60)
-    const secs = seconds % 60
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
-  }
-
-  const renderBanner = () => {
-    if (!banner) {
-      return null
-    }
-
-    const backgroundColor =
-      banner.type === 'success'
-        ? Colors.green
-        : banner.type === 'error'
-        ? Colors.red
-        : Colors.amber
-
-    return (
-      <View style={[styles.banner, { backgroundColor }]}>
-        <Text style={styles.bannerText}>{banner.message}</Text>
-      </View>
-    )
-  }
-
-  if (loading) {
-    return (
-      <View style={styles.centered}>
-        <ActivityIndicator color={Colors.dark} />
-      </View>
-    )
-  }
-
-  if (error) {
-    return (
-      <View style={styles.centered}>
-        <Text style={styles.errorText}>{error}</Text>
-      </View>
-    )
-  }
-
   return (
-    <View style={styles.root}>
-      {initialRegion && (
-        <View style={styles.mapContainer}>
-          <MapView style={StyleSheet.absoluteFill} initialRegion={initialRegion}>
-            <UrlTile
-              urlTemplate="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              maximumZ={19}
-              flipY={false}
-            />
-
-            {polylineCoordinates.length > 0 && (
-              <Polyline
-                coordinates={polylineCoordinates}
-                strokeColor={Colors.dark}
-                strokeWidth={3}
-                lineDashPattern={[8, 6]}
-              />
-            )}
-
-            {stops.map(stop => {
-              const coords = DEV_STOPS_COORDS[stop.name]
-              if (!coords) {
-                return null
-              }
-              return (
-                <Marker
-                  key={stop.id}
-                  coordinate={coords}
-                  pinColor={Colors.primary}
-                  title={stop.name}
-                />
-              )
-            })}
-
-            {busPosition && (
-              <Marker coordinate={busPosition} title="Bus">
-                <View style={styles.busMarker}>
-                  <Text style={styles.busMarkerText}>🚌</Text>
-                </View>
-              </Marker>
-            )}
-
-            {userLocation && (
-              <Marker coordinate={userLocation} title="You">
-                <View style={styles.userDot} />
-              </Marker>
-            )}
-          </MapView>
-
-          {trip && (
-            <View style={styles.routeBadge}>
-              <View style={styles.liveDotOuter}>
-                <View style={styles.liveDotInner} />
-              </View>
-              <Text style={styles.routeBadgeText}>
-                {route ? route.name : 'ROUTE'} · LIVE
-              </Text>
-            </View>
-          )}
+    <SafeAreaView
+      style={styles.safeArea}
+      edges={['top']}
+    >
+      {!mapExpanded && (
+        <View style={styles.topBar}>
+          <View>
+            <Text style={styles.greetingText}>Hello,</Text>
+            <Text style={styles.nameText}>
+              {getFirstName(profileData?.full_name || '')}
+            </Text>
+          </View>
+          <TouchableOpacity
+            onPress={() => router.push('/(student)/profile')}
+            style={styles.avatar}>
+            <Text style={styles.avatarText}>
+              {getInitials(profileData?.full_name || '')}
+            </Text>
+          </TouchableOpacity>
         </View>
       )}
 
-      <View style={styles.bottomSheet}>
-        {renderBanner()}
-        <ScrollView
-          contentContainerStyle={styles.bottomContent}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
+      <Animated.View style={{ height: mapHeightAnim }}>
+        <MapView
+          style={styles.map}
+          initialRegion={{
+            latitude: 13.1986,
+            longitude: 79.9650,
+            latitudeDelta: 0.15,
+            longitudeDelta: 0.15,
+          }}
+          scrollEnabled={mapExpanded}
+          zoomEnabled={mapExpanded}
+          pitchEnabled={false}
+          rotateEnabled={false}
         >
-          <View style={styles.busRow}>
-            <View>
-              <Text style={styles.busLabel}>Bus Number</Text>
-              <Text style={styles.busNumber}>{trip?.bus_number ?? student?.bus_number}</Text>
-            </View>
-            <View>
-              <Text style={styles.busLabel}>Number Plate</Text>
-              <Text style={styles.busPlate}>TN09 AB 1234</Text>
-            </View>
+          {stops.length > 1 && (
+            <Polyline
+              coordinates={stops.map(s => ({
+                latitude: s.latitude || 13.1986,
+                longitude: s.longitude || 79.9650,
+              }))}
+              strokeColor={Colors.textPrimary}
+              strokeWidth={3}
+              lineDashPattern={[8, 4]}
+            />
+          )}
+
+          {stops.map((stop, i) => (
+            <Marker
+              key={stop.id}
+              coordinate={{
+                latitude: stop.latitude || 13.1986 + i * 0.01,
+                longitude: stop.longitude || 79.9650 + i * 0.01,
+              }}
+              title={stop.name}
+            >
+              <View style={styles.stopMarker} />
+            </Marker>
+          ))}
+
+          {busLocation && (
+            <Marker
+              coordinate={{
+                latitude: busLocation.latitude,
+                longitude: busLocation.longitude,
+              }}
+              title={`Bus ${studentData?.bus_number}`}
+            >
+              <View style={styles.busMarker}>
+                <Ionicons name="bus" size={14} color={Colors.yellowBar} />
+                <Text style={styles.busMarkerText}>
+                  {studentData?.bus_number}
+                </Text>
+              </View>
+            </Marker>
+          )}
+        </MapView>
+
+        <View style={styles.mapTopOverlay}>
+          <View style={styles.liveBadge}>
+            <View style={[styles.liveDot, { backgroundColor: tripData ? Colors.green : Colors.textTertiary }]} />
+            <Text style={styles.liveText}>
+              {tripData ? 'LIVE' : 'NO ACTIVE TRIP'}
+            </Text>
           </View>
 
-          <View style={styles.routeRow}>
-            <Text style={styles.routeName}>
-              {route ? `${route.name}` : 'Route info soon'}
-            </Text>
-            <View
-              style={[
-                styles.statusBadge,
-                trip?.status === 'active' ? styles.statusOnTrip : styles.statusIdle,
-              ]}
-            >
-              <Text
-                style={[
-                  styles.statusText,
-                  trip?.status === 'active' ? styles.statusTextOnTrip : styles.statusTextIdle,
-                ]}
-              >
-                {trip?.status === 'active' ? 'ON TRIP' : 'NOT STARTED'}
+          <TouchableOpacity
+            onPress={toggleMap}
+            style={styles.expandButton}>
+            <Ionicons
+              name={mapExpanded ? "contract-outline" : "expand-outline"}
+              size={16} color={Colors.textPrimary}
+            />
+          </TouchableOpacity>
+        </View>
+
+        {mapExpanded && (
+          <TouchableOpacity
+            onPress={toggleMap}
+            style={styles.collapseHint}>
+            <Ionicons name="chevron-down" size={14} color={Colors.surface} />
+            <Text style={styles.collapseText}>Collapse map</Text>
+          </TouchableOpacity>
+        )}
+      </Animated.View>
+
+      {!mapExpanded && (
+        <View style={styles.floatingCard}>
+          <View style={styles.dragHandle} />
+
+          <View style={styles.infoRow}>
+            <View>
+              <Text style={styles.infoLabel}>Bus No.</Text>
+              <Text style={styles.busNoText}>
+                {studentData?.bus_number?.replace('Bus ', '') || '---'}
               </Text>
             </View>
-          </View>
-
-          <View style={styles.nextStopRow}>
-            <Text style={styles.nextStopIcon}>📍</Text>
-            <View>
-              <Text style={styles.nextStopLabel}>Next stop</Text>
-              <Text style={styles.nextStopName}>{nextStopName}</Text>
+            <View style={styles.alignEnd}>
+              <Text style={styles.infoLabel}>Number Plate</Text>
+              <Text style={styles.plateText}>
+                {busData?.number_plate || '---'}
+              </Text>
             </View>
           </View>
 
           <View style={styles.divider} />
 
+          <View style={styles.infoRowCenter}>
+            <View>
+              <Text style={styles.infoLabel}>Route</Text>
+              <Text style={styles.routeText}>
+                {busData?.route_id ? 'North Campus Route' : '---'}
+              </Text>
+            </View>
+            <View style={[styles.statusBadge, { backgroundColor: tripData ? Colors.successBg : Colors.modalBorder }]}>
+              <View style={[styles.statusDot, { backgroundColor: tripData ? Colors.green : Colors.textTertiary }]} />
+              <Text style={[styles.statusText, { color: tripData ? Colors.greenDark : Colors.textSecond }]}>
+                {tripData ? 'ON TRIP' : 'NOT STARTED'}
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.divider} />
+
+          <View style={styles.infoRowCenterSmallBottom}>
+            <View style={styles.flex1}>
+              <Text style={styles.infoLabel}>Next Stop</Text>
+              <View style={styles.nextStopRow}>
+                <Ionicons name="location" size={16} color={Colors.yellowBar} />
+                <Text style={styles.nextStopText}>
+                  {stops[0]?.name || studentData?.bus_stop || '---'}
+                </Text>
+              </View>
+            </View>
+            <View style={styles.alignEnd}>
+              <Text style={styles.infoLabel}>ETA</Text>
+              <Text style={styles.etaText}>~8 min</Text>
+            </View>
+          </View>
+
+          {alertStatus === 'accepted' && (
+            <View style={[styles.alertBanner, styles.alertAccepted]}>
+              <Ionicons name="checkmark-circle" size={20} color={Colors.green} />
+              <Text style={[styles.alertText, { color: Colors.greenDark }]}>Driver is waiting for you!</Text>
+            </View>
+          )}
+
+          {alertStatus === 'denied' && (
+            <View style={[styles.alertBanner, styles.alertDenied]}>
+              <Ionicons name="close-circle" size={20} color={Colors.red} />
+              <Text style={[styles.alertText, { color: Colors.redDark }]}>Driver cannot wait at this time.</Text>
+            </View>
+          )}
+
+          {alertStatus === 'expired' && (
+            <View style={[styles.alertBanner, styles.alertExpired]}>
+              <Ionicons name="time-outline" size={20} color={Colors.amberDark} />
+              <View style={styles.flex1}>
+                <Text style={[styles.alertText, { color: Colors.amberDarker }]}>Driver did not respond.</Text>
+                <Text style={styles.alertSubText}>Tap below to try again.</Text>
+              </View>
+            </View>
+          )}
+
+          {error && (
+            <View style={[styles.alertBanner, styles.alertDenied]}>
+              <Ionicons name="alert-circle-outline" size={18} color={Colors.red} />
+              <Text style={[styles.errorText, { color: Colors.redDark }]}>{error}</Text>
+            </View>
+          )}
+        </View>
+      )}
+
+      {!mapExpanded && (
+        <View style={styles.fixedBottomBar}>
           <TouchableOpacity
+            onPress={handleWaitForMe}
+            disabled={waitLoading}
+            activeOpacity={0.85}
             style={[
-              styles.waitButton,
-              isWaiting ? styles.waitButtonWaiting : styles.waitButtonDefault,
-            ]}
-            activeOpacity={0.9}
-            onPress={handleWaitForMePress}
-          >
-            <Text
-              style={[
-                styles.waitButtonText,
-                isWaiting ? styles.waitButtonTextWaiting : styles.waitButtonTextDefault,
-              ]}
-            >
-              {isWaiting
-                ? `⏳ Waiting... ${formatCountdown(remainingSeconds)}`
-                : '🙋 Wait for Me'}
-            </Text>
+              styles.waitForMeBtn,
+              { backgroundColor: alertStatus === 'pending' ? Colors.yellowBar : Colors.textPrimary },
+              waitLoading && { opacity: 0.7 }
+            ]}>
+            {waitLoading ? (
+              <ActivityIndicator color={alertStatus === 'pending' ? Colors.textPrimary : Colors.surface} />
+            ) : (
+              <>
+                <Ionicons
+                  name={alertStatus === 'pending' ? "time-outline" : "hand-left-outline"}
+                  size={18}
+                  color={alertStatus === 'pending' ? Colors.textPrimary : Colors.surface}
+                />
+                <Text style={[
+                  styles.waitForMeBtnText,
+                  { color: alertStatus === 'pending' ? Colors.textPrimary : Colors.surface }
+                ]}>
+                  {alertStatus === 'pending'
+                    ? `Waiting... ${formatTime(secondsLeft)}`
+                    : 'Wait for Me'
+                  }
+                </Text>
+              </>
+            )}
           </TouchableOpacity>
-        </ScrollView>
-      </View>
-    </View>
+        </View>
+      )}
+    </SafeAreaView>
   )
 }
 
 const styles = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: Colors.bg,
-  },
-  mapContainer: {
-    height: SCREEN_HEIGHT * 0.45,
-  },
-  bottomSheet: {
-    flex: 1,
-    marginTop: -24,
-    backgroundColor: Colors.surface,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 12,
-    elevation: 6,
-  },
-  bottomContent: {
-    paddingHorizontal: 20,
-    paddingTop: 20,
-    paddingBottom: 24,
-  },
-  centered: {
-    flex: 1,
+  mapWebPlaceholder: {
+    backgroundColor: Colors.mapWebBg,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: Colors.bg,
   },
-  errorText: {
-    fontSize: 14,
-    color: Colors.red,
-    textAlign: 'center',
-    paddingHorizontal: 24,
-  },
-  busRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 12,
-  },
-  busLabel: {
-    fontSize: 12,
-    color: Colors.textSecond,
+  mapWebText: {
+    color: Colors.textTertiary,
+    fontSize: 13,
+    marginTop: 8,
     fontFamily: 'DMSans_400Regular',
   },
-  busNumber: {
-    marginTop: 4,
+  loadingContainer: {
+    flex: 1,
+    backgroundColor: Colors.yellowBar,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  safeArea: {
+    flex: 1,
+    backgroundColor: Colors.yellowBar,
+  },
+  topBar: {
+    paddingHorizontal: 24,
+    paddingTop: 12,
+    paddingBottom: 16,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  greetingText: {
+    fontFamily: 'DMSans_400Regular',
+    fontSize: 14,
+    color: Colors.black60,
+  },
+  nameText: {
+    fontFamily: 'DMSans_800ExtraBold',
     fontSize: 22,
     color: Colors.textPrimary,
-    fontFamily: 'DMMono_700Bold',
   },
-  busPlate: {
-    marginTop: 4,
-    fontSize: 13,
-    color: Colors.textSecond,
-    fontFamily: 'DMMono_400Regular',
+  avatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: Colors.textPrimary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: Colors.shadow,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    elevation: 4,
   },
-  routeRow: {
+  avatarText: {
+    fontFamily: 'DMSans_700Bold',
+    fontSize: 15,
+    color: Colors.yellowBar,
+  },
+  map: {
+    flex: 1,
+  },
+  stopMarker: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: Colors.yellowBar,
+    borderWidth: 2,
+    borderColor: Colors.textPrimary,
+  },
+  busMarker: {
+    backgroundColor: Colors.textPrimary,
+    borderRadius: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 16,
+    gap: 4,
   },
-  routeName: {
-    fontSize: 13,
-    color: Colors.textSecond,
-    fontFamily: 'DMSans_500Medium',
+  busMarkerText: {
+    fontFamily: 'DMMono_400Regular',
+    fontSize: 11,
+    color: Colors.surface,
+  },
+  mapTopOverlay: {
+    position: 'absolute',
+    top: 12,
+    left: 12,
+    right: 12,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  liveBadge: {
+    backgroundColor: Colors.white95,
+    borderRadius: 20,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    shadowColor: Colors.shadow,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  liveDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+  },
+  liveText: {
+    fontFamily: 'DMSans_600SemiBold',
+    fontSize: 11,
+    color: Colors.textPrimary,
+  },
+  expandButton: {
+    backgroundColor: Colors.white95,
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: Colors.shadow,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  collapseHint: {
+    position: 'absolute',
+    bottom: 16,
+    alignSelf: 'center',
+    backgroundColor: Colors.textPrimary,
+    borderRadius: 20,
+    paddingVertical: 8,
+    paddingHorizontal: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  collapseText: {
+    fontFamily: 'DMSans_600SemiBold',
+    fontSize: 12,
+    color: Colors.surface,
+  },
+  floatingCard: {
+    flex: 1,
+    backgroundColor: Colors.surface,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    marginTop: -24,
+    paddingHorizontal: 24,
+    paddingTop: 28,
+    paddingBottom: 100,
+    shadowColor: Colors.shadow,
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.08,
+    shadowRadius: 16,
+    elevation: 10,
+  },
+  dragHandle: {
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: Colors.border,
+    alignSelf: 'center',
+    marginBottom: 24,
+  },
+  infoRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 20,
+  },
+  infoLabel: {
+    fontFamily: 'DMSans_600SemiBold',
+    fontSize: 10,
+    color: Colors.textTertiary,
+    letterSpacing: 1.5,
+    textTransform: 'uppercase',
+    marginBottom: 4,
+  },
+  busNoText: {
+    fontFamily: 'DMMono_400Regular',
+    fontSize: 26,
+    color: Colors.textPrimary,
+    fontWeight: '700',
+  },
+  alignEnd: {
+    alignItems: 'flex-end',
+  },
+  plateText: {
+    fontFamily: 'DMMono_400Regular',
+    fontSize: 16,
+    color: Colors.textPrimary,
+  },
+  divider: {
+    height: 1,
+    backgroundColor: Colors.modalBorder,
+    marginBottom: 20,
+  },
+  infoRowCenter: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  routeText: {
+    fontFamily: 'DMSans_700Bold',
+    fontSize: 14,
+    color: Colors.textPrimary,
   },
   statusBadge: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 999,
+    borderRadius: 20,
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
   },
-  statusOnTrip: {
-    backgroundColor: Colors.green,
-  },
-  statusIdle: {
-    backgroundColor: '#E5E7EB',
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
   },
   statusText: {
-    fontSize: 11,
     fontFamily: 'DMSans_600SemiBold',
+    fontSize: 11,
   },
-  statusTextOnTrip: {
-    color: '#022C22',
+  infoRowCenterSmallBottom: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
   },
-  statusTextIdle: {
-    color: Colors.textSecond,
+  flex1: {
+    flex: 1,
   },
   nextStopRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 16,
+    gap: 6,
   },
-  nextStopIcon: {
-    fontSize: 20,
-    marginRight: 10,
-  },
-  nextStopLabel: {
-    fontSize: 12,
-    color: Colors.textSecond,
-    fontFamily: 'DMSans_400Regular',
-  },
-  nextStopName: {
+  nextStopText: {
+    fontFamily: 'DMSans_700Bold',
     fontSize: 15,
     color: Colors.textPrimary,
-    fontFamily: 'DMSans_600SemiBold',
   },
-  divider: {
-    height: 1,
-    backgroundColor: Colors.border,
-    marginVertical: 14,
-  },
-  waitButton: {
-    borderRadius: 14,
-    paddingVertical: 14,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  waitButtonDefault: {
-    backgroundColor: Colors.dark,
-  },
-  waitButtonWaiting: {
-    backgroundColor: Colors.primary,
-  },
-  waitButtonText: {
-    fontSize: 15,
-    fontFamily: 'DMSans_700Bold',
-  },
-  waitButtonTextDefault: {
-    color: Colors.surface,
-  },
-  waitButtonTextWaiting: {
-    color: Colors.dark,
-  },
-  busMarker: {
-    padding: 4,
-    backgroundColor: Colors.surface,
-    borderRadius: 999,
-  },
-  busMarkerText: {
+  etaText: {
+    fontFamily: 'DMMono_400Regular',
     fontSize: 20,
+    color: Colors.textPrimary,
+    fontWeight: '700',
   },
-  userDot: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: Colors.blue,
-    borderWidth: 2,
-    borderColor: Colors.surface,
-  },
-  routeBadge: {
-    position: 'absolute',
-    top: 40,
-    left: 20,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 999,
-    backgroundColor: Colors.surface,
+  alertBanner: {
+    borderRadius: 14,
+    padding: 14,
+    marginTop: 16,
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 10,
+    borderWidth: 1,
   },
-  routeBadgeText: {
-    marginLeft: 8,
-    fontSize: 12,
-    color: Colors.textPrimary,
+  alertAccepted: {
+    backgroundColor: Colors.successBg,
+    borderColor: Colors.greenBorder,
+  },
+  alertDenied: {
+    backgroundColor: Colors.errorBg,
+    borderColor: Colors.redBorder,
+  },
+  alertExpired: {
+    backgroundColor: Colors.amberBg,
+    borderColor: Colors.amberBorder,
+  },
+  alertText: {
     fontFamily: 'DMSans_600SemiBold',
+    fontSize: 14,
+    flex: 1,
   },
-  liveDotOuter: {
-    width: 16,
-    height: 16,
-    borderRadius: 8,
-    backgroundColor: 'rgba(34,197,94,0.2)',
+  alertSubText: {
+    fontFamily: 'DMSans_400Regular',
+    fontSize: 12,
+    color: Colors.amberText,
+    marginTop: 2,
+  },
+  errorText: {
+    fontFamily: 'DMSans_400Regular',
+    fontSize: 13,
+    flex: 1,
+  },
+  fixedBottomBar: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: Colors.surface,
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    paddingBottom: Platform.OS === 'ios' ? 32 : 16,
+    borderTopWidth: 1,
+    borderTopColor: Colors.border,
+  },
+  waitForMeBtn: {
+    borderRadius: 14,
+    paddingVertical: 16,
+    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 10,
   },
-  liveDotInner: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: Colors.green,
-  },
-  banner: {
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    marginBottom: 12,
-  },
-  bannerText: {
-    fontSize: 13,
-    color: '#FFFFFF',
-    fontFamily: 'DMSans_500Medium',
+  waitForMeBtnText: {
+    fontFamily: 'DMSans_700Bold',
+    fontSize: 15,
   },
 })
-
